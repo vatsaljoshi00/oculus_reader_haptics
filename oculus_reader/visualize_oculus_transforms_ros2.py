@@ -1,14 +1,14 @@
-from reader  import OculusReader
+from reader import OculusReader
 from tf_transformations import quaternion_from_matrix
 import rclpy
 from rclpy.node import Node
 from rclpy.timer import Rate
 import tf2_ros
-from geometry_msgs.msg import TransformStamped
+from geometry_msgs.msg import TransformStamped, Twist
 import numpy as np
 from rclpy import time, clock
 from std_srvs.srv import SetBool,Trigger
-from std_msgs.msg import Float64MultiArray
+from std_msgs.msg import Float64MultiArray, String
 
 # For spinning
 from rclpy.executors import SingleThreadedExecutor
@@ -16,6 +16,8 @@ from threading import Thread
 
 import scipy
 from scipy.spatial.transform import Rotation
+
+import json
 
 class OculusReaderNode(Node):
     def __init__(self):
@@ -31,6 +33,8 @@ class OculusReaderNode(Node):
         self.create_subscription(Float64MultiArray, '/R_haptic_amplitude', self.right_haptic_callback, 10)
 
         # publisher
+        self.buttons_pub = self.create_publisher(String, '/controller_button_state', 10)
+        self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.robotiq_l = self.create_publisher(Float64MultiArray, '/L_gripper_forward_position_controller/commands', 10)
         self.robotiq_r = self.create_publisher(Float64MultiArray, '/R_gripper_forward_position_controller/commands', 10)
 
@@ -57,12 +61,11 @@ class OculusReaderNode(Node):
             transformations, buttons = self.oculus_reader.get_transformations_and_buttons()
 
             self.button_funcs(buttons)
+
             if 'r' not in transformations:
                 continue
             if 'l' not in transformations:
                 continue
-            
-            
 
             right_controller_pose = transformations['r']
             left_controller_pose = transformations['l']
@@ -74,6 +77,12 @@ class OculusReaderNode(Node):
                 self.br.sendTransform(tf_r)          
             else:
                 self.get_logger().warning('Invalid transform detected, not publishing TF.')  
+
+            # publish buttons info
+            buttons_msg = String()
+            buttons_msg.data = json.dumps(buttons)
+            self.buttons_pub.publish(buttons_msg)
+            
             self.rate.sleep()
 
     def button_funcs(self, buttons):
@@ -177,9 +186,6 @@ class OculusReaderNode(Node):
         # gripper control
         if buttons['LTr'] and not self.button_triggered_dict['LTr']:
             self.button_triggered_dict['LTr'] = True
-            msg = Float64MultiArray()
-            msg.data = [0.]  # close
-            self.robotiq_l.publish(msg)
         elif not buttons['LTr'] and self.button_triggered_dict['LTr']:
             self.button_triggered_dict['LTr'] = False
 
@@ -191,9 +197,6 @@ class OculusReaderNode(Node):
 
         if buttons['RTr'] and not self.button_triggered_dict['RTr']:
             self.button_triggered_dict['RTr'] = True
-            msg = Float64MultiArray()
-            msg.data = [0.]  # close
-            self.robotiq_r.publish(msg)
         elif not buttons['RTr'] and self.button_triggered_dict['RTr']:
             self.button_triggered_dict['RTr'] = False
 
@@ -203,33 +206,46 @@ class OculusReaderNode(Node):
         elif not buttons['RG'] and self.button_triggered_dict['RG']:
             self.button_triggered_dict['RG'] = False
 
-        if buttons['rightJS'][0] > 0.8 and not self.button_triggered_dict['rightJS']:
+        if abs(buttons['rightJS'][0]) > 0.0:
             self.button_triggered_dict['rightJS'] = True
-            # phase up
-            if self.phase_state_cli.wait_for_service(timeout_sec=1.0):
-                req = Trigger.Request()
-                result = self.phase_state_cli.call(req)
-                self.get_logger().info(f'Result of service call: {result.success}, message: {result.message}')
-            else:
-                self.get_logger().error('Service not available')
-        elif buttons['rightJS'][0] < 0.2 and self.button_triggered_dict['rightJS']:
+
+            # Publish cmd_vel as Twist using rightJS
+            cmd_vel_msg = Twist()
+            # Apply deadzone and offset
+            def apply_deadzone_offset(value, deadzone=0.2):
+                if abs(value) < deadzone:
+                    return 0.0
+                else:
+                    sign = 1 if value > 0 else -1
+                    return value - deadzone * sign
+            
+            linear_x = apply_deadzone_offset(buttons['rightJS'][1])
+            angular_z = apply_deadzone_offset(buttons['rightJS'][0])
+            cmd_vel_msg.linear.x = linear_x * 0.5  # assuming y-axis is forward
+            cmd_vel_msg.angular.z = -angular_z * 2  # x-axis is turn
+            self.cmd_vel_pub.publish(cmd_vel_msg)
+        elif abs(buttons['rightJS'][0]) < 0.2:
+            cmd_vel_msg = Twist()
+            cmd_vel_msg.linear.x = 0.0
+            cmd_vel_msg.angular.z = 0.0
+            self.cmd_vel_pub.publish(cmd_vel_msg)
             self.button_triggered_dict['rightJS'] = False
 
         # Using LeftGrasp control left gripper to  decrease accidental triggering
-        if buttons['leftGrip'][0] > 0.99 and not self.button_triggered_dict['leftGrip']:
+        if buttons['leftGrip'][0] > 0.1:
             self.button_triggered_dict['leftGrip'] = True
             msg = Float64MultiArray()
-            msg.data = [0.8]  # close
+            msg.data = [buttons['leftGrip'][0]]  # scale by trigger pressure
             self.robotiq_l.publish(msg)
-        elif buttons['leftGrip'][0] < 0.2 and self.button_triggered_dict['leftGrip']:
+        elif buttons['leftGrip'][0] < 0.1 and self.button_triggered_dict['leftGrip']:
             self.button_triggered_dict['leftGrip'] = False
         
-        if buttons['rightGrip'][0] > 0.99 and not self.button_triggered_dict['rightGrip']:
+        if buttons['rightGrip'][0] > 0.1:
             self.button_triggered_dict['rightGrip'] = True
             msg = Float64MultiArray()
-            msg.data = [0.8]  # close
+            msg.data = [buttons['rightGrip'][0]]  # scale by trigger pressure
             self.robotiq_r.publish(msg)
-        elif buttons['rightGrip'][0] < 0.2 and self.button_triggered_dict['rightGrip']:
+        elif buttons['rightGrip'][0] < 0.1 and self.button_triggered_dict['rightGrip']:
             self.button_triggered_dict['rightGrip'] = False
 
 
@@ -239,8 +255,8 @@ class OculusReaderNode(Node):
         t.header.stamp = self.get_clock().now().to_msg()
         t.header.frame_id = 'oculus_base'
         t.child_frame_id = name
-        t.transform.translation.x = -translation[2]
-        t.transform.translation.y = -translation[0]
+        t.transform.translation.x = translation[2]
+        t.transform.translation.y = translation[0]
         t.transform.translation.z = translation[1]
 
         rot_m = np.array([[transform[0][0], transform[0][1], transform[0][2],],
